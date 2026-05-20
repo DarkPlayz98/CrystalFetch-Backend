@@ -3,44 +3,31 @@ from flask_cors import CORS
 import os
 import uuid
 import threading
-import subprocess
-import shutil
-import mimetypes
-import requests
+import time
+import yt_dlp
 from pathlib import Path
 from urllib.parse import urlparse
 
-
 app = Flask(__name__)
 CORS(app)
-
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-
 JOBS = {}
 LOCK = threading.Lock()
-
-
-
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB limit
 
 def set_job(job_id, **fields):
     with LOCK:
         if job_id not in JOBS:
-            JOBS[job_id] = {}
+            JOBS[job_id] = {'timestamp': time.time()}
         JOBS[job_id].update(fields)
-
-
-
 
 def get_job(job_id):
     with LOCK:
         return dict(JOBS.get(job_id, {}))
-
-
-
 
 def valid_http_url(url):
     try:
@@ -49,122 +36,91 @@ def valid_http_url(url):
     except Exception:
         return False
 
-
-
-
-def guess_extension(url, content_type, fallback="mp4"):
-    path_ext = Path(urlparse(url).path).suffix.lstrip(".")
-    if path_ext:
-        return path_ext
-
-
-    if content_type:
-        mime = content_type.split(";")[0].strip().lower()
-        guessed = mimetypes.guess_extension(mime)
-        if guessed:
-            return guessed.lstrip(".")
-
-
-    return fallback
-
-
-
-
-def download_to_path(url, path):
-    with requests.get(url, stream=True, timeout=60, allow_redirects=True) as r:
-        r.raise_for_status()
-        content_type = r.headers.get("Content-Type", "")
-
-
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 256):
-                if chunk:
-                    f.write(chunk)
-
-
-    return content_type
-
-
-
-
 def process_job(job_id, url, fmt):
-    raw_tmp = DOWNLOAD_DIR / f"{job_id}.download"
-
-
     try:
-        set_job(job_id, status="processing", message="Downloading...", filename=None, download_url=None)
-
-
-        content_type = download_to_path(url, raw_tmp)
-
+        set_job(job_id, status="processing", message="Extracting media...", filename=None, download_url=None)
+        
+        ydl_opts = {
+            'outtmpl': str(DOWNLOAD_DIR / f"{job_id}.%(ext)s"),
+            'noplaylist': True,
+            'max_filesize': MAX_FILE_SIZE,
+            'quiet': True,
+            'no_warnings': True
+        }
 
         if fmt == "mp3":
-            if shutil.which("ffmpeg") is None:
-                raise RuntimeError("ffmpeg is not installed on the server.")
-
-
-            out_path = DOWNLOAD_DIR / f"{job_id}.mp3"
-            set_job(job_id, message="Converting to MP3...")
-
-
-            subprocess.run(
-                [
-                    "ffmpeg", "-y",
-                    "-i", str(raw_tmp),
-                    "-vn",
-                    "-codec:a", "libmp3lame",
-                    "-q:a", "2",
-                    str(out_path)
-                ],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-
-
-            raw_tmp.unlink(missing_ok=True)
-
-
+            ydl_opts.update({
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+            })
+            expected_ext = 'mp3'
         else:
-            ext = guess_extension(url, content_type, fallback="mp4")
-            out_path = DOWNLOAD_DIR / f"{job_id}.{ext}"
-            raw_tmp.replace(out_path)
+            ydl_opts.update({
+                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                'merge_output_format': 'mp4',
+            })
+            expected_ext = 'mp4'
 
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+            
+        final_path = DOWNLOAD_DIR / f"{job_id}.{expected_ext}"
+        
+        if not final_path.exists():
+            downloaded_files = list(DOWNLOAD_DIR.glob(f"{job_id}.*"))
+            if not downloaded_files:
+                raise RuntimeError("Failed to process or download video.")
+            final_path = downloaded_files[0]
+
+        final_size = os.path.getsize(final_path) / (1024 * 1024) 
 
         set_job(
             job_id,
             status="done",
-            message="Ready",
-            filename=out_path.name,
-            download_url=f"/files/{out_path.name}"
+            message=f"Ready ({final_size:.1f} MB)",
+            filename=final_path.name,
+            download_url=f"/files/{final_path.name}"
         )
 
-
     except Exception as e:
-        try:
-            raw_tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
+        for f in DOWNLOAD_DIR.glob(f"{job_id}.*"):
+            f.unlink(missing_ok=True)
+            
+        error_msg = str(e)
+        if "Unsupported URL" in error_msg:
+            error_msg = "Unsupported URL or private video."
+        elif "max_filesize" in error_msg.lower():
+            error_msg = "Video exceeds the 100MB limit."
+            
+        set_job(job_id, status="error", message=error_msg)
 
+def cleanup_old_files():
+    while True:
+        time.sleep(1800)
+        current_time = time.time()
+        with LOCK:
+            expired_jobs = [jid for jid, data in JOBS.items() if current_time - data.get('timestamp', current_time) > 3600]
+            for jid in expired_jobs:
+                filename = JOBS[jid].get('filename')
+                if filename:
+                    file_path = DOWNLOAD_DIR / filename
+                    file_path.unlink(missing_ok=True)
+                del JOBS[jid]
 
-        set_job(job_id, status="error", message=str(e))
-
-
-
+cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
+cleanup_thread.start()
 
 @app.get("/")
 def home():
-    return "CrystalFetch backend is running."
-
-
-
+    return "CrystalFetch backend is running on Render."
 
 @app.get("/api/health")
 def health():
     return jsonify(ok=True)
-
-
-
 
 @app.post("/api/job")
 def create_job():
@@ -172,46 +128,30 @@ def create_job():
     url = (data.get("url") or "").strip()
     fmt = (data.get("format") or "mp4").strip().lower()
 
-
     if fmt not in ("mp4", "mp3"):
-        return jsonify(ok=False, error="format must be mp4 or mp3"), 400
-
-
+        return jsonify(ok=False, error="Format must be MP4 or MP3"), 400
     if not valid_http_url(url):
-        return jsonify(ok=False, error="Enter a valid http/https direct media URL."), 400
-
+        return jsonify(ok=False, error="Invalid URL. Enter a valid link."), 400
 
     job_id = uuid.uuid4().hex
-    set_job(job_id, status="queued", message="Queued", filename=None, download_url=None)
-
+    set_job(job_id, status="queued", message="Starting extractor...", filename=None, download_url=None)
 
     thread = threading.Thread(target=process_job, args=(job_id, url, fmt), daemon=True)
     thread.start()
 
-
     return jsonify(ok=True, job_id=job_id)
-
-
-
 
 @app.get("/api/job/<job_id>")
 def job_status(job_id):
     job = get_job(job_id)
     if not job:
-        return jsonify(ok=False, error="Job not found"), 404
-
-
+        return jsonify(ok=False, error="Job expired or not found"), 404
     return jsonify(ok=True, job_id=job_id, **job)
-
-
-
 
 @app.get("/files/<path:filename>")
 def files(filename):
     return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
 
-
-
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=False)
+    
