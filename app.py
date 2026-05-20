@@ -40,16 +40,20 @@ def process_job(job_id, url, fmt):
     try:
         set_job(job_id, status="processing", message="Extracting media...", filename=None, download_url=None)
         
-        # --- NEW SETTINGS: The Android Disguise ---
+        # --- THE ULTIMATE DISGUISE ---
         ydl_opts = {
             'outtmpl': str(DOWNLOAD_DIR / f"{job_id}.%(ext)s"),
             'noplaylist': True,
             'max_filesize': MAX_FILE_SIZE,
             'quiet': True,
             'no_warnings': True,
-            # This line tricks YouTube into thinking we are the Android app
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            },
             'extractor_args': {
-                'youtube': ['client=android']
+                # Force YouTube to treat the request like a Smart TV or iOS device
+                'youtube': ['client=tv,ios']
             }
         }
 
@@ -96,7 +100,7 @@ def process_job(job_id, url, fmt):
             f.unlink(missing_ok=True)
             
         error_msg = str(e)
-        if "Sign in" in error_msg:
+        if "Sign in" in error_msg or "bot" in error_msg.lower():
             error_msg = "YouTube blocked the server. Try a different video."
         elif "Unsupported URL" in error_msg:
             error_msg = "Unsupported URL or private video."
