@@ -40,22 +40,26 @@ def process_job(job_id, url, fmt):
     try:
         set_job(job_id, status="processing", message="Extracting media...", filename=None, download_url=None)
         
-        # --- THE ULTIMATE DISGUISE ---
+        # --- BASE SETTINGS ---
         ydl_opts = {
             'outtmpl': str(DOWNLOAD_DIR / f"{job_id}.%(ext)s"),
             'noplaylist': True,
             'max_filesize': MAX_FILE_SIZE,
             'quiet': True,
             'no_warnings': True,
-            'http_headers': {
+        }
+
+        # --- THE SMART DISGUISE ---
+        # Only use the fake Apple/TV nametag if it is a YouTube link. 
+        # Using this on Facebook breaks the Facebook extractor!
+        if "youtube.com" in url or "youtu.be" in url:
+            ydl_opts['http_headers'] = {
                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            },
-            'extractor_args': {
-                # Force YouTube to treat the request like a Smart TV or iOS device
+            }
+            ydl_opts['extractor_args'] = {
                 'youtube': ['client=tv,ios']
             }
-        }
 
         if fmt == "mp3":
             ydl_opts.update({
@@ -101,7 +105,9 @@ def process_job(job_id, url, fmt):
             
         error_msg = str(e)
         if "Sign in" in error_msg or "bot" in error_msg.lower():
-            error_msg = "YouTube blocked the server. Try a different video."
+            error_msg = "Platform blocked the server. Try a different video."
+        elif "Cannot parse data" in error_msg:
+            error_msg = "Facebook blocked this video (it might be private)."
         elif "Unsupported URL" in error_msg:
             error_msg = "Unsupported URL or private video."
         elif "max_filesize" in error_msg.lower():
